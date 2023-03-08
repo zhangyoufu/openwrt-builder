@@ -1,0 +1,22 @@
+name: 小米路由器4A千兆版(v1)
+on:
+  push:
+    branches:
+    - '**'
+    paths:
+    - .github/workflows/_build.yml
+    - .github/workflows/xiaomi_mi-router-4a-gigabit.yml
+defaults:
+  run:
+    shell: bash
+jobs:
+  build:
+    uses: ./.github/workflows/_build.yml
+    with:
+      target: ramips
+      subtarget: mt7621
+      device: xiaomi_mi-router-4a-gigabit
+      version: 22.03.3
+      config: |
+        ## disable kernel2minor (target/linux/ramips/mt7621/target.mk)
+        CONFIG_USE_MINOR=n

@@ -1,0 +1,264 @@
+on:
+  workflow_call:
+    inputs:
+      target:
+        required: true
+        type: string
+      subtarget:
+        required: true
+        type: string
+      device:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      config:
+        type: string
+## DO NOT set concurrency group for this workflow.
+## https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners#workflow-continuity
+## In addition, if the workflow run has been successfully queued, but has not been processed by a GitHub-hosted runner within 45 minutes, then the queued workflow run is discarded.
+defaults:
+  run:
+    shell: bash
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ inputs.target }}
+      SUBTARGET: ${{ inputs.subtarget }}
+      DEVICE: ${{ inputs.device }}
+      VERSION: ${{ inputs.version }}
+      CONFIG: ${{ inputs.config }}
+    steps:
+    - name: Setup environment variables according to version (snapshot or stable release)
+      run: |-
+        if [ "${VERSION}" = "snapshot" ]; then
+          DOWNLOAD_DIR=snapshots
+          echo 'GIT_BRANCH=master' >>"${GITHUB_ENV}"
+          echo 'TOOLS_TAG=latest' >>"${GITHUB_ENV}"
+        else
+          DOWNLOAD_DIR=releases/${VERSION}
+          echo "GIT_BRANCH=openwrt-${VERSION%.*}" >>"${GITHUB_ENV}"
+          echo "TOOLS_TAG=openwrt-${VERSION%.*}" >>"${GITHUB_ENV}"
+        fi
+        echo "DOWNLOAD_URL=https://downloads.cdn.openwrt.org/${DOWNLOAD_DIR}/targets/${TARGET}/${SUBTARGET}/" >> "${GITHUB_ENV}"
+
+    - name: Install dependencies and prepare empty directories for runner user
+      shell: sudo /bin/bash --noprofile --norc -e -o pipefail {0}
+      run: |-
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install --option Dpkg::Use-Pty=no --no-install-recommends --yes \
+          bzip2 \
+          ca-certificates \
+          curl \
+          file \
+          gawk \
+          gcc \
+          g++ \
+          git \
+          libncurses-dev \
+          make \
+          patch \
+          python3 \
+          python3-distutils \
+          rsync \
+          unzip \
+          wget \
+          xz-utils
+        install --directory --mode=0750 --owner=runner --group=runner /openwrt
+        install --directory --mode=0750 --owner=runner --group=runner /__w
+
+    - name: Clone openwrt repo
+      run: git clone --branch "${GIT_BRANCH}" --single-branch "https://github.com/${GITHUB_REPOSITORY_OWNER}/openwrt" /openwrt
+
+    - name: Setup pre-built tools
+      working-directory: /openwrt
+      run: |-
+        ## download and extract
+        docker run --rm "ghcr.io/openwrt/tools:${TOOLS_TAG}" cat tools.tar | tar --extract --skip-old-files
+
+        ## mimic GitHub Actions Docker container path, so that pre-built tools with DT_RUNPATH work out-of-box
+        ## see https://forum.openwrt.org/t/new-master-2203-building-issue-zstd-library-incorrect-version/123376
+        mkdir --parents /__w/openwrt/openwrt
+        ln --symbolic "${PWD}" /__w/openwrt/openwrt/openwrt
+
+        ## fake stamp files
+        for DIR in $(find build_dir/host -type f -name .built | xargs dirname); do
+          cd -- "${DIR}"
+          mv .prepared* .prepared
+          touch .prepared .configured .built
+          cd -- "${OLDPWD}"
+        done
+        touch staging_dir/host/stamp/.*_installed
+
+    - name: Setup feeds
+      working-directory: /openwrt
+      run: |-
+        ## enable only essential packages and luci, disable routing and telephony feeds
+        cp feeds.conf.default feeds.conf
+        sed --in-place --expression='/routing\|telephony/d' feeds.conf
+
+        ## update & install feeds
+        scripts/feeds update -a
+        scripts/feeds install -a
+
+    - name: Setup config
+      working-directory: /openwrt
+      run: |-
+        ## start with diffconfig from official release
+        wget --no-verbose --output-document .config "${DOWNLOAD_URL}config.buildinfo"
+
+        ## disable all device profiles
+        sed --in-place --expression='/^CONFIG_TARGET_DEVICE_/d' .config
+
+        ## append to .config to override default/existing configuration
+        cat >>.config <<EOF
+
+        ## enable ccache
+        CONFIG_CCACHE=y
+
+        ## do not enable all device profiles by default
+        CONFIG_TARGET_ALL_PROFILES=n
+
+        ## enable target device profile
+        CONFIG_TARGET_DEVICE_${TARGET}_${SUBTARGET}_DEVICE_${DEVICE}=y
+
+        ## do not embedded version in filename
+        CONFIG_VERSION_FILENAMES=n
+        CONFIG_VERSION_CODE_FILENAMES=n
+
+        ## do not build BPF toolchain (tools/llvm-bpf)
+        CONFIG_BPF_TOOLCHAIN_NONE=y
+
+        ## do not build image builder, toolchain, sdk
+        CONFIG_IB=n
+        CONFIG_MAKE_TOOLCHAIN=n
+        CONFIG_SDK=n
+
+        ## do not build ALL_KMODS, ALL_NONSHARED, kernel-debug tarball
+        CONFIG_ALL_KMODS=n
+        CONFIG_ALL_NONSHARED=n
+        CONFIG_COLLECT_KERNEL_DEBUG=n
+
+        ## adjust package selection
+        CONFIG_PACKAGE_libbpf=n
+        CONFIG_PACKAGE_libelf=n
+        CONFIG_PACKAGE_libxtables=n
+        CONFIG_PACKAGE_luci=n
+        CONFIG_PACKAGE_luci-ssl=n
+        CONFIG_PACKAGE_luci-app-firewall=n
+        CONFIG_PACKAGE_luci-proto-ppp=n
+        CONFIG_PACKAGE_px5g-wolfssl=n
+        CONFIG_PACKAGE_tc-full=n
+        CONFIG_PACKAGE_tc-mod-iptables=n
+        CONFIG_PACKAGE_zlib=n
+
+        ## package-specific configuration
+        CONFIG_DROPBEAR_ECC=y
+
+        ## device-specific configuration
+        ${CONFIG}
+        EOF
+
+        ## inflate .config
+        make defconfig
+
+    ## Linux source code is required by both toolchain/kernel-headers and target/linux.
+    ## We have to download before faking stamp files for toolchain.
+    - name: Download Linux source code
+      working-directory: /openwrt
+      run: make toolchain/kernel-headers/download
+
+    - name: Setup external toolchain
+      working-directory: /openwrt
+      run: |-
+        set -x
+
+        ## download & extract toolchain
+        TOOLCHAIN_FILENAME=$(curl --fail --silent --show-error "${DOWNLOAD_URL}" | grep --only-matching --perl-regexp '(?<=<a href=")openwrt-toolchain-[^"]+')
+        wget --progress=dot:mega "${DOWNLOAD_URL}${TOOLCHAIN_FILENAME}"
+        TOOLCHAIN_NAME=${TOOLCHAIN_FILENAME%.tar.*}
+        set +eo pipefail; TOOLCHAIN_DIR_NAME=$(tar --list --file "${TOOLCHAIN_FILENAME}" --wildcards "${TOOLCHAIN_NAME}/toolchain-*" 2>/dev/null | head -n 1 | cut -d/ -f2); set -eo pipefail
+        tar --extract --file="${TOOLCHAIN_FILENAME}" --directory=staging_dir --strip-components=1 "${TOOLCHAIN_NAME}/${TOOLCHAIN_DIR_NAME}"
+
+        ## remove wrapper scripts
+        for FILEPATH in staging_dir/${TOOLCHAIN_DIR_NAME}/bin/*.bin; do mv -- "${FILEPATH}" "${FILEPATH%.bin}"; done
+
+        ## toolchain/Makefile: $(TOOLCHAIN_DIR)/stamp/.ver_check
+        git log --format=%h -1 toolchain >"staging_dir/${TOOLCHAIN_DIR_NAME}/stamp/.ver_check"
+
+        ## toolchain/Makefile: $(TOOLCHAIN_DIR)/info.mk
+        touch "staging_dir/${TOOLCHAIN_DIR_NAME}/info.mk"
+
+        ## extract toolchain versions
+        BINUTILS_VERSION=$(fgrep CONFIG_BINUTILS_VERSION= .config | cut -d'"' -f2)
+        FORTIFY_HEADERS_VERSION=$(fgrep PKG_VERSION:= toolchain/fortify-headers/Makefile | cut -d= -f2)
+        GCC_VERSION=$(fgrep CONFIG_GCC_VERSION= .config | cut -d'"' -f2)
+        GDB_VERSION=$(fgrep PKG_VERSION:= toolchain/gdb/Makefile | cut -d= -f2)
+        MUSL_VERSION=$(fgrep PKG_VERSION:= toolchain/musl/common.mk | cut -d= -f2)
+        for FILEPATH in "target/linux/${TARGET}/${SUBTARGET}/target.mk" "target/linux/${TARGET}/Makefile"; do
+          KERNEL_PATCHVER=$(fgrep KERNEL_PATCHVER:= "${FILEPATH}" | cut -d= -f2) && break
+        done
+        [ -n "${KERNEL_PATCHVER}" ] || exit 1
+        LINUX_VERSION=${KERNEL_PATCHVER}$(fgrep "LINUX_VERSION-${KERNEL_PATCHVER}" "include/kernel-${KERNEL_PATCHVER}" | cut -d= -f2 | xargs)
+
+        ## mimic native toolchain
+        touch \
+          dl/binutils-${BINUTILS_VERSION}.tar.xz \
+          dl/fortify-headers-${FORTIFY_HEADERS_VERSION}.tar.gz \
+          dl/gcc-${GCC_VERSION}.tar.xz \
+          dl/gdb-${GDB_VERSION}.tar.xz \
+          dl/musl-${MUSL_VERSION}.tar.gz
+        mkdir "build_dir/${TOOLCHAIN_DIR_NAME}"
+        for COMPONENT in \
+          binutils-${BINUTILS_VERSION} \
+          fortify-headers-${FORTIFY_HEADERS_VERSION} \
+          gcc-${GCC_VERSION}-initial \
+          gcc-${GCC_VERSION}-final \
+          gdb-${GDB_VERSION} \
+          linux-${LINUX_VERSION} \
+          musl-${MUSL_VERSION} \
+        ; do
+          COMPONENT_DIR=build_dir/${TOOLCHAIN_DIR_NAME}/${COMPONENT}
+          mkdir -- "${COMPONENT_DIR}"
+          cd -- "${COMPONENT_DIR}"
+          touch .prepared .configured .built
+          cd -- "${OLDPWD}"
+        done
+        for COMPONENT in \
+          binutils \
+          fortify-headers \
+          gcc_initial \
+          gcc_final \
+          gdb \
+          linux \
+          musl \
+        ; do
+          touch "staging_dir/${TOOLCHAIN_DIR_NAME}/stamp/.${COMPONENT}_installed"
+        done
+
+    - name: Load ccache
+      uses: actions/cache@v3
+      with:
+        path: /openwrt/.ccache
+        key: ${{ env.VERSION }}/${{ inputs.target }}/${{ inputs.subtarget }}/${{ inputs.device }}
+        restore-keys: |-
+          ${{ env.VERSION }}/${{ inputs.target }}/${{ inputs.subtarget }}/
+          ${{ env.VERSION }}/${{ inputs.target }}/
+
+    ## the parallelism of OpenWrt Buildroot is surprisingly bad
+    - name: Build everything
+      working-directory: /openwrt
+      run: make -j3
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: openwrt-${{ inputs.device }}-${{ github.run_id }}
+        retention-days: 1
+        path: |-
+          /openwrt/bin/targets/${{ inputs.target }}/${{ inputs.subtarget }}/
+          !/openwrt/bin/targets/${{ inputs.target }}/${{ inputs.subtarget }}/packages/
+          !/openwrt/bin/targets/${{ inputs.target }}/${{ inputs.subtarget }}/sha256sums
