@@ -17,6 +17,7 @@ jobs:
       subtarget: mt7621
       device: xiaomi_mi-router-4a-gigabit
       version: 22.03.3
+      debug_ci: true
       config: |
         ## disable kernel2minor (target/linux/ramips/mt7621/target.mk)
         CONFIG_USE_MINOR=n
