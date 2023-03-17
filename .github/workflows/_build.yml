@@ -157,6 +157,7 @@ jobs:
         CONFIG_PACKAGE_px5g-wolfssl=n
         CONFIG_PACKAGE_tc-full=n
         CONFIG_PACKAGE_tc-mod-iptables=n
+        CONFIG_PACKAGE_tcpdump-mini=y
         CONFIG_PACKAGE_zlib=n
 
         ## package-specific configuration
