@@ -265,7 +265,7 @@ jobs:
       run: make --debug=vw V=sc
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: openwrt-${{ inputs.device }}-${{ github.run_id }}
         retention-days: 1
